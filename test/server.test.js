@@ -24,7 +24,6 @@ const endpoint = (path) => `http://127.0.0.1:${port}${path}`
 
 const depositForBurnEvent = [{
   type: 'event', name: 'DepositForBurn', inputs: [
-    { indexed: true, name: 'nonce', type: 'uint64' },
     { indexed: true, name: 'burnToken', type: 'address' },
     { indexed: false, name: 'amount', type: 'uint256' },
     { indexed: true, name: 'depositor', type: 'address' },
@@ -33,7 +32,8 @@ const depositForBurnEvent = [{
     { indexed: false, name: 'destinationTokenMessenger', type: 'bytes32' },
     { indexed: false, name: 'destinationCaller', type: 'bytes32' },
     { indexed: false, name: 'maxFee', type: 'uint256' },
-    { indexed: false, name: 'minFinalityThreshold', type: 'uint32' },
+    { indexed: true, name: 'minFinalityThreshold', type: 'uint32' },
+    { indexed: false, name: 'hookData', type: 'bytes' },
   ],
 }]
 
@@ -46,11 +46,11 @@ const depositReceipt = ({ source, destination, domain = destination.cctp.domain,
   status: 'success', blockNumber: 1n, logs: [{
     address: messenger,
     topics: encodeEventTopics({ abi: depositForBurnEvent, eventName: 'DepositForBurn', args: {
-      nonce: 1n, burnToken: source.usdcAddress, depositor: '0x00000000000000000000000000000000000000a1',
+      burnToken: source.usdcAddress, depositor: '0x00000000000000000000000000000000000000a1', minFinalityThreshold: 1000,
     } }),
     data: encodeAbiParameters(
       depositForBurnEvent[0].inputs.filter((input) => !input.indexed),
-      [7250000n, padHex('0x00000000000000000000000000000000000000a1', { size: 32 }), domain, padHex(destination.cctp.tokenMessenger, { size: 32 }), padHex('0x', { size: 32 }), 0n, 1000],
+      [7250000n, padHex('0x00000000000000000000000000000000000000a1', { size: 32 }), domain, padHex(destination.cctp.tokenMessenger, { size: 32 }), padHex('0x', { size: 32 }), 0n, '0x'],
     ),
   }],
 })
@@ -107,14 +107,22 @@ test('CCTP receipt verification derives the event amount and verifies the config
   assert.equal(result.destination.chainId, 1)
 })
 
-test('CCTP verification accepts the verified App Kit bridge contract burn event', async () => {
+test('CCTP verification rejects an App Kit FeePaid event as a DepositForBurn event', async () => {
   const source = mainnetChain(8453)
-  const destination = mainnetChain(5042)
-  const result = await verifyBridge({
-    source, destinationChainId: destination.chainId, txHash: `0x${'9'.repeat(64)}`,
-    client: mockClient(depositReceipt({ source, destination, messenger: '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0' })),
-  })
-  assert.equal(result.destination.chainId, 5042)
+  await assert.rejects(
+    verifyBridge({
+      source, destinationChainId: 5042, txHash: `0x${'9'.repeat(64)}`,
+      client: mockClient({
+        status: 'success', blockNumber: 1n,
+        logs: [{
+          address: '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0',
+          topics: ['0xaf81f7f62ee75dafb220171fa668da33f390a1cc0afcd2df70558e33970acee2'],
+          data: '0x',
+        }],
+      }),
+    }),
+    /No CCTP DepositForBurn event/,
+  )
 })
 
 test('CCTP verification rejects unsupported destination domains, route mismatches, and unverified TokenMessenger logs', async () => {

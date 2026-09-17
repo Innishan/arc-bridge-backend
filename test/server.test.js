@@ -107,6 +107,16 @@ test('CCTP receipt verification derives the event amount and verifies the config
   assert.equal(result.destination.chainId, 1)
 })
 
+test('CCTP verification accepts the verified App Kit bridge contract burn event', async () => {
+  const source = mainnetChain(8453)
+  const destination = mainnetChain(5042)
+  const result = await verifyBridge({
+    source, destinationChainId: destination.chainId, txHash: `0x${'9'.repeat(64)}`,
+    client: mockClient(depositReceipt({ source, destination, messenger: '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0' })),
+  })
+  assert.equal(result.destination.chainId, 5042)
+})
+
 test('CCTP verification rejects unsupported destination domains, route mismatches, and unverified TokenMessenger logs', async () => {
   const source = mainnetChain(8453)
   const destination = mainnetChain(1)

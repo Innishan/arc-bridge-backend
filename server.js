@@ -38,6 +38,11 @@ const depositForBurnEvent = [{
 // against Circle's CCTP V2 and USDC contract-address references.
 const CCTP_V2_MAINNET_MESSENGER = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
 const CCTP_V2_TESTNET_MESSENGER = '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'
+// App Kit routes its existing custom-fee bridge through this verified bridge
+// contract, which emits the same DepositForBurn event as the CCTP messenger.
+// This is an analytics verification allowlist entry only; it does not affect
+// Bridge Kit configuration or transaction execution.
+const APP_KIT_MAINNET_BRIDGE_CONTRACT = '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0'
 const chainMetadata = [
   ['mainnet', 'Arc', 5042, 26, 'https://rpc.mainnet.arc.io/', 'https://explorer.arc.io/tx/{hash}', '0x3600000000000000000000000000000000000000'],
   ['mainnet', 'Arbitrum', 42161, 3, 'https://arb1.arbitrum.io/rpc', 'https://arbiscan.io/tx/{hash}', '0xaf88d065e77c8cc2239327c5edb3a432268e5831'],
@@ -184,9 +189,10 @@ export async function verifyBridge({ source, destinationChainId, txHash, client 
   const receipt = await client.getTransactionReceipt({ hash: txHash })
   if (receipt.status !== 'success') throw new Error('Transaction was not successful on-chain')
 
-  const tokenMessenger = source.cctp.tokenMessenger.toLowerCase()
+  const verifiedEmitters = new Set([source.cctp.tokenMessenger.toLowerCase()])
+  if (source.environment === 'mainnet') verifiedEmitters.add(APP_KIT_MAINNET_BRIDGE_CONTRACT.toLowerCase())
   const verifiedLog = receipt.logs.find((log) => {
-    if (log.address.toLowerCase() !== tokenMessenger) return false
+    if (!verifiedEmitters.has(log.address.toLowerCase())) return false
     try {
       const decoded = decodeEventLog({ abi: depositForBurnEvent, data: log.data, topics: log.topics })
       return decoded.eventName === 'DepositForBurn'

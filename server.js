@@ -17,6 +17,7 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const MICRO_POINTS_PER_POINT = 1_000_000n
 const MAX_POINTS_MICRO = 1_000_000n * MICRO_POINTS_PER_POINT
 const REFERRAL_POINTS_MICRO = 50n * MICRO_POINTS_PER_POINT
+const APP_KIT_BRIDGE_CONTRACT = '0xB3FA262d0fB521cc93bE83d87b322b8A23DAf3F0'.toLowerCase()
 
 const depositForBurnEvent = [{
   type: 'event',
@@ -32,6 +33,19 @@ const depositForBurnEvent = [{
     { indexed: false, name: 'maxFee', type: 'uint256' },
     { indexed: true, name: 'minFinalityThreshold', type: 'uint32' },
     { indexed: false, name: 'hookData', type: 'bytes' },
+  ],
+}]
+
+const feePaidEvent = [{
+  type: 'event',
+  name: 'FeePaid',
+  inputs: [
+    { indexed: true, name: 'user', type: 'address' },
+    { indexed: true, name: 'token', type: 'address' },
+    { indexed: false, name: 'amountBridged', type: 'uint256' },
+    { indexed: false, name: 'totalFee', type: 'uint256' },
+    { indexed: false, name: 'feeAmount', type: 'uint256' },
+    { indexed: true, name: 'feeRecipient', type: 'address' },
   ],
 }]
 
@@ -166,6 +180,56 @@ function awardPoints(points, user, type, requestedMicro, entry) {
   return awarded
 }
 
+// This is intentionally not invoked by request handling. A production
+// reconciliation must first identify the exact affected bridge ledger entries
+// from a production data export, then call this once with those transaction
+// hashes. It moves existing bridge attribution in place, preserving the
+// original reward entry, transaction hash, amount, timestamp, and global cap.
+export function reconcileBridgePointAttribution(data, { from, to, txHashes }) {
+  const oldWallet = normalizedAddress(from)
+  const newWallet = normalizedAddress(to)
+  if (!oldWallet || !newWallet || oldWallet === newWallet) throw new Error('Valid distinct reconciliation wallets are required')
+  if (!Array.isArray(txHashes) || txHashes.length === 0 || txHashes.some((hash) => typeof hash !== 'string' || !HASH_PATTERN.test(hash))) {
+    throw new Error('At least one valid transaction hash is required for reconciliation')
+  }
+
+  const requested = new Set(txHashes.map((hash) => hash.toLowerCase()))
+  const points = pointsState(data)
+  const entries = points.ledger.filter((entry) => entry?.type === 'bridge' && requested.has(entry.txHash?.toLowerCase()))
+  if (entries.length !== requested.size) throw new Error('Every requested transaction must have exactly one bridge ledger entry')
+  if (new Set(entries.map((entry) => entry.txHash.toLowerCase())).size !== entries.length) throw new Error('Bridge ledger contains duplicate reconciliation entries')
+
+  const alreadyReconciled = entries.every((entry) => entry.wallet?.toLowerCase() === newWallet && entry.attributionCorrection?.from === oldWallet && entry.attributionCorrection?.to === newWallet)
+  if (alreadyReconciled) return { movedMicro: '0', reconciled: false }
+  if (entries.some((entry) => entry.wallet?.toLowerCase() !== oldWallet)) throw new Error('Bridge ledger entry does not have the expected incorrect attribution')
+  const oldUser = points.users[oldWallet]
+  if (!oldUser) throw new Error('Incorrectly attributed points user was not found')
+
+  const bridgeByHash = new Map(data.bridges.map((bridge) => [bridge.txHash?.toLowerCase(), bridge]))
+  for (const entry of entries) {
+    const bridge = bridgeByHash.get(entry.txHash.toLowerCase())
+    if (!bridge || bridge.environment !== 'mainnet' || bridge.depositor?.toLowerCase() !== oldWallet) throw new Error('Bridge record does not match the incorrect attribution')
+    if (bridge.user && bridge.user.toLowerCase() !== newWallet) throw new Error('Bridge record already belongs to a different verified user')
+    if (String(bridge.amountAtomic) !== String(entry.amountAtomic)) throw new Error('Bridge amount does not match its ledger entry')
+  }
+
+  const moved = entries.reduce((total, entry) => total + validMicroPoints(entry.pointsMicro), 0n)
+  if (moved === 0n) return { movedMicro: '0', reconciled: false }
+  if (validMicroPoints(oldUser.bridgePointsMicro) < moved || validMicroPoints(oldUser.pointsMicro) < moved) throw new Error('Incorrect user balance cannot cover the reconciled bridge entries')
+
+  const newUser = pointsUser(points, newWallet)
+  oldUser.pointsMicro = (validMicroPoints(oldUser.pointsMicro) - moved).toString()
+  oldUser.bridgePointsMicro = (validMicroPoints(oldUser.bridgePointsMicro) - moved).toString()
+  newUser.pointsMicro = (validMicroPoints(newUser.pointsMicro) + moved).toString()
+  newUser.bridgePointsMicro = (validMicroPoints(newUser.bridgePointsMicro) + moved).toString()
+  for (const entry of entries) {
+    entry.wallet = newWallet
+    entry.attributionCorrection = { from: oldWallet, to: newWallet, correctedAt: entry.timestamp }
+    bridgeByHash.get(entry.txHash.toLowerCase()).user = newWallet
+  }
+  return { movedMicro: moved.toString(), reconciled: true }
+}
+
 function pointsResponse(points, address) {
   const user = points.users[address] || { address, pointsMicro: '0', bridgePointsMicro: '0', referralPointsMicro: '0', successfulReferrals: 0 }
   const distributed = validMicroPoints(points.totalDistributedMicro)
@@ -267,11 +331,36 @@ export async function verifyBridge({ source, destinationChainId, txHash, client 
     throw new Error('CCTP event destination messenger does not match the verified destination route')
   }
 
+  const transaction = await client.getTransaction({ hash: txHash })
+  const transactionFrom = normalizedAddress(transaction?.from)
+  if (!transactionFrom) throw new Error('Source transaction did not contain a valid sender')
+
+  // App Kit submits the CCTP burn itself. Its depositor is therefore the App
+  // Kit contract, not the user entitled to points. For this one flow require
+  // the companion FeePaid event to bind the canonical burn to transaction.from.
+  if (source.environment === 'mainnet' && args.depositor.toLowerCase() === APP_KIT_BRIDGE_CONTRACT) {
+    const feePaidLogs = receipt.logs.flatMap((log) => {
+      try {
+        const decoded = decodeEventLog({ abi: feePaidEvent, data: log.data, topics: log.topics })
+        return decoded.eventName === 'FeePaid' ? [{ log, args: decoded.args }] : []
+      } catch {
+        return []
+      }
+    })
+    if (feePaidLogs.some(({ log }) => log.address.toLowerCase() !== APP_KIT_BRIDGE_CONTRACT)) throw new Error('App Kit FeePaid event was emitted by an unexpected contract')
+    if (feePaidLogs.length !== 1) throw new Error('App Kit bridge attribution requires exactly one valid FeePaid event from the App Kit bridge contract')
+    const feePaid = feePaidLogs[0].args
+    if (feePaid.user.toLowerCase() !== transactionFrom) throw new Error('App Kit FeePaid user does not match the source transaction sender')
+    if (feePaid.token.toLowerCase() !== source.usdcAddress.toLowerCase()) throw new Error('App Kit FeePaid token does not match the configured source USDC')
+    if (feePaid.amountBridged !== args.amount) throw new Error('App Kit FeePaid amount does not match the verified CCTP amount')
+  }
+
   const block = await client.getBlock({ blockNumber: receipt.blockNumber })
   return {
     source,
     destination,
     depositor: args.depositor.toLowerCase(),
+    user: transactionFrom,
     amount: formatUnits(args.amount, source.usdcDecimals),
     amountAtomic: args.amount.toString(),
     timestamp: Number(block.timestamp) * 1000,
@@ -301,7 +390,7 @@ app.post('/api/bridges', async (req, res) => {
   if (recordsForEnvironment(data, environment).some((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())) {
     const points = pointsState(data)
     const existing = recordsForEnvironment(data, environment).find((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())
-    return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.depositor ? { ...pointsResponse(points, existing.depositor), awarded: 0, referralAwarded: false } : undefined })
+    return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.user ? { ...pointsResponse(points, existing.user), awarded: 0, referralAwarded: false } : undefined })
   }
 
   try {
@@ -312,7 +401,7 @@ app.post('/api/bridges', async (req, res) => {
     if (recordsForEnvironment(data, environment).some((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())) {
       const points = pointsState(data)
       const existing = recordsForEnvironment(data, environment).find((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())
-      return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.depositor ? { ...pointsResponse(points, existing.depositor), awarded: 0, referralAwarded: false } : undefined })
+      return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.user ? { ...pointsResponse(points, existing.user), awarded: 0, referralAwarded: false } : undefined })
     }
     data.bridges.push({
       environment,
@@ -323,20 +412,21 @@ app.post('/api/bridges', async (req, res) => {
       amount: verified.amount,
       amountAtomic: verified.amountAtomic,
       ...(verified.depositor ? { depositor: verified.depositor } : {}),
+      ...(verified.user ? { user: verified.user } : {}),
       txHash,
       timestamp: verified.timestamp,
     })
     let pointsResult
-    if (environment === 'mainnet' && verified.depositor) {
+    if (environment === 'mainnet' && verified.user) {
       const points = pointsState(data)
-      const wallet = verified.depositor.toLowerCase()
+      const wallet = verified.user.toLowerCase()
       const user = pointsUser(points, wallet)
       const bridgeAward = awardPoints(points, user, 'bridge', BigInt(verified.amountAtomic), {
         wallet, txHash, amountAtomic: verified.amountAtomic, timestamp: verified.timestamp,
       })
       let referralAward = 0n
       const referral = points.referrals[wallet]
-      const firstVerifiedBridge = !data.bridges.slice(0, -1).some((bridge) => bridge.environment === 'mainnet' && bridge.depositor?.toLowerCase() === wallet)
+      const firstVerifiedBridge = !data.bridges.slice(0, -1).some((bridge) => bridge.environment === 'mainnet' && bridge.user?.toLowerCase() === wallet)
       if (firstVerifiedBridge && referral && !referral.rewarded) {
         const referrer = pointsUser(points, referral.referrer)
         referralAward = awardPoints(points, referrer, 'referral', REFERRAL_POINTS_MICRO, {

@@ -21,6 +21,8 @@ const server = app.listen(0, '127.0.0.1')
 await new Promise((resolve) => server.once('listening', resolve))
 const port = server.address().port
 const endpoint = (path) => `http://127.0.0.1:${port}${path}`
+const wallet = (suffix) => `0x${suffix.padStart(40, '0')}`
+let verifiedFixture = { amount: '7.25', amountAtomic: '7250000', depositor: wallet('a1') }
 
 const depositForBurnEvent = [{
   type: 'event', name: 'DepositForBurn', inputs: [
@@ -57,13 +59,13 @@ const depositReceipt = ({ source, destination, domain = destination.cctp.domain,
 
 before(() => {
   setBridgeVerifierForTests(async ({ source, destinationChainId }) => {
-    const destination = supportedChains.find((chain) => chain.environment === source.environment && chain.chainId === destinationChainId)
+    if (verifiedFixture.error) throw new Error('verification failed')
+    const destination = supportedChains.find((chain) => chain.environment === source.environment && chain.chainId === (destinationChainId ?? 5042002))
     assert.ok(destination)
     return {
       source,
       destination,
-      amount: '7.25',
-      amountAtomic: '7250000',
+      ...verifiedFixture,
       timestamp: 2000,
     }
   })
@@ -222,4 +224,101 @@ test('custom absolute DATA_FILE path recreates its parent directory before persi
   assert.equal(response.status, 200)
   assert.equal(existsSync(process.env.DATA_FILE), true)
   assert.ok(JSON.parse(readFileSync(process.env.DATA_FILE, 'utf-8')).bridges.some((bridge) => bridge.txHash === txHash))
+})
+
+const resetPointsData = () => writeFileSync(process.env.DATA_FILE, JSON.stringify({ bridges: [], points: { totalDistributedMicro: '0', users: {}, referrals: {}, ledger: [] } }))
+const post = async (path, body) => fetch(endpoint(path), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+const recordMainnetBridge = (txChar, amountAtomic, depositor, extra = {}) => {
+  verifiedFixture = { amount: String(Number(amountAtomic) / 1_000_000), amountAtomic, depositor }
+  return post('/api/bridges', { environment: 'mainnet', sourceChainId: 8453, destinationChainId: 5042, txHash: `0x${txChar.repeat(64)}`, amount: '999999', wallet: wallet('ffff'), ...extra })
+}
+
+test('verified bridge points use exact atomic USDC amounts and ignore client amount or wallet', async () => {
+  resetPointsData()
+  const depositor = wallet('101')
+  let response = await recordMainnetBridge('a', '1000000', depositor)
+  let body = await response.json()
+  assert.equal(body.points.awarded, 1)
+  assert.equal(body.points.walletPoints, 1)
+
+  response = await recordMainnetBridge('b', '50000', depositor)
+  body = await response.json()
+  assert.equal(body.points.awarded, 0.05)
+  assert.equal(body.points.points, 1.05)
+
+  response = await recordMainnetBridge('c', '125500000', depositor)
+  body = await response.json()
+  assert.equal(body.points.awarded, 125.5)
+  assert.equal(body.points.points, 126.55)
+  const points = await (await fetch(endpoint(`/api/points?address=${depositor}`))).json()
+  assert.equal(points.points, 126.55)
+  assert.equal(points.bridgePoints, 126.55)
+  assert.equal((await (await fetch(endpoint(`/api/points?address=${wallet('ffff')}`))).json()).points, 0)
+})
+
+test('failed and duplicate bridge submissions award no additional points', async () => {
+  const depositor = wallet('102')
+  const before = await (await fetch(endpoint(`/api/points?address=${depositor}`))).json()
+  verifiedFixture = { error: true }
+  const failed = await post('/api/bridges', { environment: 'mainnet', sourceChainId: 8453, destinationChainId: 5042, txHash: `0x${'0'.repeat(64)}` })
+  assert.equal(failed.status, 400)
+  assert.equal((await (await fetch(endpoint(`/api/points?address=${depositor}`))).json()).points, before.points)
+  verifiedFixture = { amount: '1', amountAtomic: '1000000', depositor }
+  const txHash = `0x${'d'.repeat(64)}`
+  const first = await post('/api/bridges', { environment: 'mainnet', sourceChainId: 8453, destinationChainId: 5042, txHash })
+  assert.equal((await first.json()).points.awarded, 1)
+  const duplicate = await post('/api/bridges', { environment: 'mainnet', sourceChainId: 8453, destinationChainId: 5042, txHash })
+  assert.equal((await duplicate.json()).points.awarded, 0)
+  const after = await (await fetch(endpoint(`/api/points?address=${depositor}`))).json()
+  assert.equal(after.points, before.points + 1)
+})
+
+test('referrals are immutable, reject invalid and self referrals, and reward only a first verified bridge', async () => {
+  const referrer = wallet('201')
+  const referred = wallet('202')
+  assert.equal((await post('/api/referrals', { referrer, referred })).status, 200)
+  assert.equal((await post('/api/referrals', { referrer: referred, referred })).status, 400)
+  assert.equal((await post('/api/referrals', { referrer: 'invalid', referred })).status, 400)
+  assert.equal((await post('/api/referrals', { referrer: wallet('203'), referred })).status, 409)
+  let referrerPoints = await (await fetch(endpoint(`/api/points?address=${referrer}`))).json()
+  assert.equal(referrerPoints.points, 0)
+  let first = await recordMainnetBridge('e', '50000', referred)
+  assert.equal((await first.json()).points.referralAwarded, true)
+  referrerPoints = await (await fetch(endpoint(`/api/points?address=${referrer}`))).json()
+  assert.equal(referrerPoints.referralPoints, 50)
+  assert.equal(referrerPoints.successfulReferrals, 1)
+  const second = await recordMainnetBridge('f', '1000000', referred)
+  assert.equal((await second.json()).points.referralAwarded, false)
+  referrerPoints = await (await fetch(endpoint(`/api/points?address=${referrer}`))).json()
+  assert.equal(referrerPoints.referralPoints, 50)
+})
+
+test('testnet bridges do not award mainnet points', async () => {
+  const depositor = wallet('301')
+  verifiedFixture = { amount: '10', amountAtomic: '10000000', depositor }
+  const response = await post('/api/bridges', { environment: 'testnet', chain: 'Base_Sepolia', txHash: `0x${'7'.repeat(64)}` })
+  assert.equal(response.status, 200)
+  const points = await (await fetch(endpoint(`/api/points?address=${depositor}`))).json()
+  assert.equal(points.points, 0)
+})
+
+test('the global cap clamps bridge and referral awards and completes the program exactly', async () => {
+  const referrer = wallet('401')
+  const referred = wallet('402')
+  const data = JSON.parse(readFileSync(process.env.DATA_FILE, 'utf-8'))
+  data.points.totalDistributedMicro = '999999996750'
+  data.points.totalDistributed = 999999.99675
+  data.points.users = {}
+  data.points.referrals = { [referred]: { referrer, createdAt: 1, rewarded: false, rewardedAt: null } }
+  data.points.ledger = []
+  writeFileSync(process.env.DATA_FILE, JSON.stringify(data))
+  const response = await recordMainnetBridge('8', '50000', referred)
+  const body = await response.json()
+  assert.equal(body.points.awarded, 0.00325)
+  assert.equal(body.points.referralAwarded, false)
+  assert.equal(body.points.programComplete, true)
+  const program = await (await fetch(endpoint(`/api/points?address=${referred}`))).json()
+  assert.equal(program.totalDistributed, 1000000)
+  assert.equal(program.remaining, 0)
+  assert.equal(program.programComplete, true)
 })

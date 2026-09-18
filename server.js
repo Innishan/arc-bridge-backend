@@ -13,6 +13,10 @@ const DATA_FILE = process.env.DATA_FILE || './bridges.json'
 const ENVIRONMENTS = new Set(['testnet', 'mainnet'])
 const HASH_PATTERN = /^0x[a-fA-F0-9]{64}$/
 const ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const MICRO_POINTS_PER_POINT = 1_000_000n
+const MAX_POINTS_MICRO = 1_000_000n * MICRO_POINTS_PER_POINT
+const REFERRAL_POINTS_MICRO = 50n * MICRO_POINTS_PER_POINT
 
 const depositForBurnEvent = [{
   type: 'event',
@@ -110,7 +114,10 @@ function loadData() {
   if (!fs.existsSync(DATA_FILE)) return { bridges: [] }
   try {
     const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'))
-    return { bridges: Array.isArray(data.bridges) ? data.bridges.filter((bridge) => bridge && typeof bridge === 'object') : [] }
+    return {
+      ...data,
+      bridges: Array.isArray(data.bridges) ? data.bridges.filter((bridge) => bridge && typeof bridge === 'object') : [],
+    }
   } catch {
     return { bridges: [] }
   }
@@ -119,6 +126,61 @@ function loadData() {
 function saveData(data) {
   ensureDataFileDirectory()
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2))
+}
+
+const validMicroPoints = (value) => typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : 0n
+const pointsNumber = (microPoints) => Number(microPoints) / Number(MICRO_POINTS_PER_POINT)
+const normalizedAddress = (value) => typeof value === 'string' && ADDRESS_PATTERN.test(value) ? value.toLowerCase() : null
+
+function pointsState(data) {
+  if (!data.points || typeof data.points !== 'object') data.points = {}
+  const points = data.points
+  points.maxPoints = 1_000_000
+  points.totalDistributedMicro = validMicroPoints(points.totalDistributedMicro).toString()
+  points.totalDistributed = pointsNumber(validMicroPoints(points.totalDistributedMicro))
+  points.programComplete = validMicroPoints(points.totalDistributedMicro) >= MAX_POINTS_MICRO
+  if (!points.users || typeof points.users !== 'object') points.users = {}
+  if (!points.referrals || typeof points.referrals !== 'object') points.referrals = {}
+  if (!Array.isArray(points.ledger)) points.ledger = []
+  return points
+}
+
+function pointsUser(points, address) {
+  if (!points.users[address]) {
+    points.users[address] = { address, pointsMicro: '0', bridgePointsMicro: '0', referralPointsMicro: '0', successfulReferrals: 0 }
+  }
+  return points.users[address]
+}
+
+function awardPoints(points, user, type, requestedMicro, entry) {
+  const distributed = validMicroPoints(points.totalDistributedMicro)
+  const awarded = requestedMicro > MAX_POINTS_MICRO - distributed ? MAX_POINTS_MICRO - distributed : requestedMicro
+  if (awarded <= 0n) return 0n
+  user.pointsMicro = (validMicroPoints(user.pointsMicro) + awarded).toString()
+  const category = type === 'bridge' ? 'bridgePointsMicro' : 'referralPointsMicro'
+  user[category] = (validMicroPoints(user[category]) + awarded).toString()
+  points.totalDistributedMicro = (distributed + awarded).toString()
+  points.totalDistributed = pointsNumber(distributed + awarded)
+  points.programComplete = distributed + awarded >= MAX_POINTS_MICRO
+  points.ledger.push({ ...entry, type, pointsMicro: awarded.toString(), points: pointsNumber(awarded) })
+  return awarded
+}
+
+function pointsResponse(points, address) {
+  const user = points.users[address] || { address, pointsMicro: '0', bridgePointsMicro: '0', referralPointsMicro: '0', successfulReferrals: 0 }
+  const distributed = validMicroPoints(points.totalDistributedMicro)
+  return {
+    address,
+    points: pointsNumber(validMicroPoints(user.pointsMicro)),
+    walletPoints: pointsNumber(validMicroPoints(user.pointsMicro)),
+    bridgePoints: pointsNumber(validMicroPoints(user.bridgePointsMicro)),
+    referralPoints: pointsNumber(validMicroPoints(user.referralPointsMicro)),
+    successfulReferrals: user.successfulReferrals || 0,
+    totalDistributed: pointsNumber(distributed),
+    remaining: pointsNumber(MAX_POINTS_MICRO - distributed),
+    maxPoints: 1_000_000,
+    programComplete: distributed >= MAX_POINTS_MICRO,
+  }
 }
 
 function parseEnvironment(value, { allowLegacyTestnet = false } = {}) {
@@ -209,6 +271,7 @@ export async function verifyBridge({ source, destinationChainId, txHash, client 
   return {
     source,
     destination,
+    depositor: args.depositor.toLowerCase(),
     amount: formatUnits(args.amount, source.usdcDecimals),
     amountAtomic: args.amount.toString(),
     timestamp: Number(block.timestamp) * 1000,
@@ -234,13 +297,23 @@ app.post('/api/bridges', async (req, res) => {
   const destinationChainId = req.body?.destinationChainId
   if (environment === 'mainnet' && !Number.isInteger(destinationChainId)) return res.status(400).json({ error: 'Mainnet destinationChainId is required' })
 
-  const data = loadData()
+  let data = loadData()
   if (recordsForEnvironment(data, environment).some((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())) {
-    return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment) })
+    const points = pointsState(data)
+    const existing = recordsForEnvironment(data, environment).find((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())
+    return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.depositor ? { ...pointsResponse(points, existing.depositor), awarded: 0, referralAwarded: false } : undefined })
   }
 
   try {
     const verified = await bridgeVerifier({ source, destinationChainId, txHash })
+    // Load after async verification so every persisted update starts from the
+    // latest JSON state and duplicate submissions cannot award points twice.
+    data = loadData()
+    if (recordsForEnvironment(data, environment).some((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())) {
+      const points = pointsState(data)
+      const existing = recordsForEnvironment(data, environment).find((bridge) => bridge.txHash?.toLowerCase() === txHash.toLowerCase())
+      return res.json({ ok: true, duplicate: true, ...analyticsResponse(data, environment), points: existing?.depositor ? { ...pointsResponse(points, existing.depositor), awarded: 0, referralAwarded: false } : undefined })
+    }
     data.bridges.push({
       environment,
       sourceChainId: verified.source.chainId,
@@ -249,14 +322,67 @@ app.post('/api/bridges', async (req, res) => {
       destinationChain: verified.destination.chain,
       amount: verified.amount,
       amountAtomic: verified.amountAtomic,
+      ...(verified.depositor ? { depositor: verified.depositor } : {}),
       txHash,
       timestamp: verified.timestamp,
     })
+    let pointsResult
+    if (environment === 'mainnet' && verified.depositor) {
+      const points = pointsState(data)
+      const wallet = verified.depositor.toLowerCase()
+      const user = pointsUser(points, wallet)
+      const bridgeAward = awardPoints(points, user, 'bridge', BigInt(verified.amountAtomic), {
+        wallet, txHash, amountAtomic: verified.amountAtomic, timestamp: verified.timestamp,
+      })
+      let referralAward = 0n
+      const referral = points.referrals[wallet]
+      const firstVerifiedBridge = !data.bridges.slice(0, -1).some((bridge) => bridge.environment === 'mainnet' && bridge.depositor?.toLowerCase() === wallet)
+      if (firstVerifiedBridge && referral && !referral.rewarded) {
+        const referrer = pointsUser(points, referral.referrer)
+        referralAward = awardPoints(points, referrer, 'referral', REFERRAL_POINTS_MICRO, {
+          wallet, referrer: referral.referrer, txHash, timestamp: verified.timestamp,
+        })
+        if (referralAward > 0n) {
+          referral.rewarded = true
+          referral.rewardedAt = verified.timestamp
+          referrer.successfulReferrals += 1
+        }
+      }
+      pointsResult = {
+        ...pointsResponse(points, wallet),
+        awarded: pointsNumber(bridgeAward),
+        referralAwarded: referralAward > 0n,
+        programComplete: points.programComplete,
+      }
+    }
     saveData(data)
-    return res.json({ ok: true, duplicate: false, ...analyticsResponse(data, environment) })
+    return res.json({ ok: true, duplicate: false, ...analyticsResponse(data, environment), ...(pointsResult ? { points: pointsResult } : {}) })
   } catch (error) {
     return res.status(400).json({ error: error instanceof Error ? error.message : 'Could not verify transaction on-chain' })
   }
+})
+
+app.get('/api/points', (req, res) => {
+  const address = normalizedAddress(req.query.address)
+  if (!address || address === ZERO_ADDRESS) return res.status(400).json({ error: 'Valid wallet address is required' })
+  const data = loadData()
+  const points = pointsState(data)
+  res.json({ ok: true, ...pointsResponse(points, address) })
+})
+
+app.post('/api/referrals', (req, res) => {
+  const referrer = normalizedAddress(req.body?.referrer)
+  const referred = normalizedAddress(req.body?.referred)
+  if (!referrer || !referred || referrer === ZERO_ADDRESS || referred === ZERO_ADDRESS) return res.status(400).json({ error: 'Valid non-zero wallet addresses are required' })
+  if (referrer === referred) return res.status(400).json({ error: 'Self-referral is not allowed' })
+  const data = loadData()
+  const points = pointsState(data)
+  const existing = points.referrals[referred]
+  if (existing) return res.status(409).json({ error: 'Referral relationship is already established', referral: existing })
+  const referral = { referrer, createdAt: Date.now(), rewarded: false, rewardedAt: null }
+  points.referrals[referred] = referral
+  saveData(data)
+  res.json({ ok: true, referred, referral })
 })
 
 // Reads default to the legacy testnet namespace; mainnet is always explicit.
